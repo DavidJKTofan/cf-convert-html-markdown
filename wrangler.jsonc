@@ -1,0 +1,30 @@
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "cf-convert-html-markdown",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-09-27",
+	"observability": {
+		"enabled": true
+	},
+	"workers_dev": false,
+	"routes": [
+		{
+			"pattern": "https://davidtofan.com/articles/*",
+			"zone_name": "davidtofan.com"
+		}
+	],
+	"ai": {
+		"binding": "AI",
+		"remote": true
+	},
+	"r2_buckets": [
+		{
+			"bucket_name": "r2-convert-html-markdown",
+			"binding": "MARKDOWN_BUCKET"
+		}
+	]
+}
