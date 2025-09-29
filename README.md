@@ -195,6 +195,6 @@ export default {
 
 Inspired by [skeptrune](https://www.skeptrune.com/posts/use-the-accept-header-to-serve-markdown-instead-of-html-to-llms/) and [Cloudflare AI Search (AI Index)](https://blog.cloudflare.com/an-ai-index-for-all-our-customers/).
 
-## Disclaimer
+# Disclaimer
 
 This project is intended for educational and personal use. You are responsible for implementing appropriate security and operational measures for production deployments. Always audit and test before production rollout.
