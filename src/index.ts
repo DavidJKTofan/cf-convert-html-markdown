@@ -1,5 +1,6 @@
-// Triggers Markdown conversion whenever Accept header
-// contains "text/markdown" or "text/plain" (case-insensitive), regardless of .md path.
+// worker-md-accept-presence-logs.ts
+// Triggers Markdown conversion when Accept header contains "text/markdown" or "text/plain",
+// or when path ends with ".md". Caches results in R2 up to 90 days.
 
 export interface Env {
 	AI: {
@@ -13,13 +14,28 @@ export interface Env {
 const MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
 const DEFAULT_USER_AGENT = 'Cloudflare-HTML-Markdown-Converter/1.0 (+https://developers.cloudflare.com/workers)';
 
-function nowIso(): string {
+function nowIso() {
 	return new Date().toISOString();
+}
+// logger helper
+function mkLog(requestId: string) {
+	return (level: 'info' | 'warn' | 'error', msg: string, meta?: Record<string, unknown>) => {
+		const payload = {
+			ts: nowIso(),
+			lvl: level,
+			req: requestId,
+			msg,
+			...(meta || {}),
+		};
+		const out = JSON.stringify(payload);
+		if (level === 'error') console.error(out);
+		else if (level === 'warn') console.warn(out);
+		else console.log(out);
+	};
 }
 
 function prefersMarkdownByPresence(acceptHeader: string | null): boolean {
 	if (!acceptHeader) return false;
-	// simple presence check (case-insensitive). Matches 'text/markdown' or 'text/plain' anywhere.
 	return /(?:\btext\/markdown\b|\btext\/plain\b)/i.test(acceptHeader);
 }
 
@@ -29,6 +45,8 @@ export default {
 			typeof crypto !== 'undefined' && 'randomUUID' in crypto
 				? (crypto as any).randomUUID()
 				: `${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+		const log = mkLog(reqId);
+
 		const url = new URL(request.url);
 		const pathname = decodeURIComponent(url.pathname || '/');
 		const acceptHeader = request.headers.get('accept');
@@ -37,49 +55,30 @@ export default {
 		const saveHtml = url.searchParams.get('saveHtml') === '1';
 		const upstreamUa = url.searchParams.get('ua') || DEFAULT_USER_AGENT;
 
-		// For debugging, log the Accept header. Check Cloudflare logs or include as response header.
-		console.log(JSON.stringify({ ts: nowIso(), reqId, pathname, acceptHeader, debugMode }));
+		log('info', 'incoming', { pathname, acceptHeader, debugMode, forceRefresh });
 
 		const acceptPrefers = prefersMarkdownByPresence(acceptHeader);
 		const isMdPath = pathname.endsWith('.md');
 
-		// Decision: Accept header presence wins. If Accept requests markdown/plain -> trigger conversion.
 		if (!acceptPrefers && !isMdPath) {
-			// Not a markdown request — proxy through origin.
+			log('info', 'proxy pass-through');
 			const proxied = await fetch(request);
-			if (debugMode) {
-				const headers = new Headers(proxied.headers);
-				headers.set('X-Debug-Request-Id', reqId);
-				headers.set('X-Debug-Accept', String(acceptHeader));
-				headers.set('X-Debug-Triggered', 'proxy');
-				return new Response(await proxied.arrayBuffer(), { status: proxied.status, statusText: proxied.statusText, headers });
-			}
 			return proxied;
 		}
 
-		// Build source target and R2 key:
-		// - If Accept triggered and path doesn't end in .md -> store under path.md
-		// - If path ends in .md -> fetch source without .md and keep key as requested path without leading slash
 		let key: string;
 		const sourceUrl = new URL(request.url);
 		if (isMdPath) {
-			key = pathname.replace(/^\//, ''); // keep .md in key (e.g., articles/foo.md)
-			sourceUrl.pathname = pathname.slice(0, -3); // source HTML at same path without .md
+			key = pathname.replace(/^\//, '');
+			sourceUrl.pathname = pathname.slice(0, -3);
 		} else {
 			const base = pathname.replace(/^\//, '').replace(/\/$/, '') || 'index';
 			key = `${base}.md`;
-			// sourceUrl stays as-is (fetch HTML at same path)
 		}
 		const target = sourceUrl.toString();
-
-		// Echo debug in response headers so curl -v shows them.
-		const responseDebugHeaders = new Headers();
-		responseDebugHeaders.set('X-Debug-Request-Id', reqId);
-		responseDebugHeaders.set('X-Debug-Accept', String(acceptHeader));
-		responseDebugHeaders.set('X-Debug-Triggered', acceptPrefers ? 'accept' : 'path-md');
+		log('info', 'conversion triggered', { key, target, reason: acceptPrefers ? 'accept' : 'path' });
 
 		try {
-			// R2 cache check
 			if (env.MARKDOWN_BUCKET && !forceRefresh) {
 				const existing = await env.MARKDOWN_BUCKET.get(key);
 				if (existing) {
@@ -88,19 +87,22 @@ export default {
 					const ageOk = uploaded !== null && Date.now() - uploaded < MAX_AGE_MS;
 					const isMarkdownCT = typeof contentType === 'string' && contentType.toLowerCase().startsWith('text/markdown');
 					if (existing && ageOk && isMarkdownCT) {
+						log('info', 'cache hit', { key, uploaded: new Date(uploaded!).toISOString(), contentType });
 						const cachedText = await existing.text();
-						responseDebugHeaders.set('X-Cache', 'r2');
-						responseDebugHeaders.set('X-Source-URL', target);
-						if (debugMode) {
-							responseDebugHeaders.set('X-Debug-R2-Uploaded', new Date(uploaded!).toISOString());
-							responseDebugHeaders.set('X-Debug-R2-ContentType', contentType);
-						}
-						return new Response(cachedText, { status: 200, headers: responseDebugHeaders });
+						return new Response(cachedText, {
+							status: 200,
+							headers: {
+								'Content-Type': 'text/markdown; charset=utf-8',
+								'X-Cache': 'r2',
+								'X-Source-URL': target,
+								'X-Debug-Request-Id': reqId,
+							},
+						});
 					}
 				}
 			}
 
-			// Fetch upstream HTML
+			log('info', 'fetching upstream', { target, ua: upstreamUa });
 			const upstream = await fetch(target, {
 				method: 'GET',
 				headers: {
@@ -111,82 +113,79 @@ export default {
 			});
 
 			if (!upstream.ok) {
-				responseDebugHeaders.set('X-Error', `upstream ${upstream.status}`);
-				return new Response(`Upstream fetch failed: ${upstream.status} ${upstream.statusText}`, {
-					status: 502,
-					headers: responseDebugHeaders,
-				});
+				log('error', 'upstream failed', { status: upstream.status, statusText: upstream.statusText });
+				return new Response(`Upstream fetch failed: ${upstream.status} ${upstream.statusText}`, { status: 502 });
 			}
 
 			const arrayBuffer = await upstream.arrayBuffer();
 			const upstreamContentType = (upstream.headers.get('content-type') || 'text/html').split(';')[0];
-			// Optionally save HTML separately (never overwrite .md key)
+
 			if (saveHtml && env.MARKDOWN_BUCKET) {
+				const htmlKey = `${key}.source.html`;
 				try {
-					const htmlKey = `${key}.source.html`;
 					await env.MARKDOWN_BUCKET.put(htmlKey, arrayBuffer, {
 						httpMetadata: { contentType: upstreamContentType },
-						customMetadata: { source: target, savedAt: nowIso(), reqId },
+						customMetadata: { source: target, savedAt: new Date().toISOString(), reqId },
 					});
+					log('info', 'saved html snapshot', { htmlKey });
 				} catch (e) {
-					console.warn('saveHtml failed', String(e));
+					log('warn', 'failed to save html snapshot', { err: String(e) });
 				}
 			}
 
-			// Convert with Workers AI
 			const blob = new Blob([arrayBuffer], { type: upstreamContentType || 'text/html' });
 			let filename = 'document';
 			try {
 				const parts = new URL(target).pathname.split('/').filter(Boolean);
 				filename = parts.length ? parts[parts.length - 1].replace(/\.[^.]+$/, '') : filename;
 			} catch {}
+			log('info', 'calling AI.toMarkdown', { filename });
+
 			const results = await env.AI.toMarkdown([{ name: filename, blob }]);
 			if (!Array.isArray(results) || !results[0] || typeof results[0].data !== 'string') {
-				responseDebugHeaders.set('X-Error', 'ai-invalid-result');
-				return new Response('AI conversion failed', { status: 500, headers: responseDebugHeaders });
+				log('error', 'ai conversion invalid result', { results });
+				return new Response('AI conversion failed', { status: 500 });
 			}
 			const markdown = results[0].data;
 
-			// Safety: if AI output looks like HTML, do not write to primary .md key
 			if (markdown.trim().startsWith('<')) {
+				log('warn', 'ai output looks like html', { snippet: markdown.slice(0, 80) });
 				if (env.MARKDOWN_BUCKET) {
 					const debugKey = `${key}.ai-failed.txt`;
 					try {
 						await env.MARKDOWN_BUCKET.put(debugKey, markdown, {
 							httpMetadata: { contentType: 'text/plain; charset=utf-8' },
-							customMetadata: { source: target, note: 'ai-output-looks-like-html', time: nowIso(), reqId },
+							customMetadata: { source: target, note: 'ai-output-looks-like-html', time: new Date().toISOString(), reqId },
 						});
-						responseDebugHeaders.set('X-Note', 'ai-output-looks-like-html-saved');
+						log('info', 'saved ai-failed output', { debugKey });
 					} catch (e) {
-						responseDebugHeaders.set('X-Note', 'ai-output-looks-like-html-save-failed');
+						log('warn', 'failed saving ai-failed output', { err: String(e) });
 					}
 				}
-				responseDebugHeaders.set('Content-Type', 'text/plain; charset=utf-8');
-				return new Response(markdown, { status: 200, headers: responseDebugHeaders });
+				return new Response(markdown, { status: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
 			}
 
-			// Save markdown to R2
 			if (env.MARKDOWN_BUCKET) {
-				try {
-					await env.MARKDOWN_BUCKET.put(key, markdown, {
-						httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
-						customMetadata: { source: target, generatedAt: nowIso(), reqId },
-					});
-				} catch (e) {
-					console.warn('r2 put failed', String(e));
-				}
+				await env.MARKDOWN_BUCKET.put(key, markdown, {
+					httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
+					customMetadata: { source: target, generatedAt: new Date().toISOString(), reqId },
+				});
+				log('info', 'markdown saved to r2', { key });
 			}
 
-			responseDebugHeaders.set('Content-Type', 'text/markdown; charset=utf-8');
-			responseDebugHeaders.set('X-Cache', env.MARKDOWN_BUCKET ? 'miss,r2-updated' : 'miss,no-r2');
-			responseDebugHeaders.set('X-Source-URL', target);
-			return new Response(markdown, { status: 200, headers: responseDebugHeaders });
+			return new Response(markdown, {
+				status: 200,
+				headers: {
+					'Content-Type': 'text/markdown; charset=utf-8',
+					'Cache-Control': 'no-cache, no-store, must-revalidate',
+					'X-Cache': env.MARKDOWN_BUCKET ? 'miss,r2-updated' : 'miss,no-r2',
+					'X-Source-URL': target,
+					'X-Debug-Request-Id': reqId,
+				},
+			});
 		} catch (err) {
-			console.error('unhandled', String(err));
-			const headers = new Headers();
-			headers.set('X-Debug-Request-Id', reqId);
-			headers.set('Content-Type', 'text/plain; charset=utf-8');
-			return new Response(`Internal Server Error\nRequest ID: ${reqId}\n${String(err)}`, { status: 500, headers });
+			log('error', 'unhandled', { err: String(err) });
+			return new Response(String(err), { status: 500 });
 		}
 	},
 };
