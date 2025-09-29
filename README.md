@@ -22,6 +22,10 @@ curl -H "Accept: text/markdown" "https://example.com/articles/cloudflare-l7-secu
 
 # Subsequent request within 90 days: served from R2
 curl -H "Accept: text/markdown" "https://example.com/articles/cloudflare-l7-security-recommendations.md"
+
+# Sending an Accept Header with Text or Markdown will return the site in Markdown too
+curl -H "Accept: text/plain" "https://www.example.com/"
+curl -H "Accept: text/markdown" "https://www.example.com/"
 ```
 
 ## Debug options
@@ -51,6 +55,8 @@ curl -H "Accept: text/markdown" "https://example.com/articles/cloudflare-l7-secu
 > Ensure that you are not blocking this Worker with your own WAF security rules.
 
 ---
+
+Inspired by [skeptrune](https://www.skeptrune.com/posts/use-the-accept-header-to-serve-markdown-instead-of-html-to-llms/) and [Cloudflare AI Search (AI Index)](https://blog.cloudflare.com/an-ai-index-for-all-our-customers/).
 
 ## Disclaimer
 
